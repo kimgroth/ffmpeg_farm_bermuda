@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=FFarm Worker
+Comment=Start the FFarm worker client
+Exec=/usr/bin/gnome-terminal -- bash -lc "cd '/home/kim/Projects/ffmpeg_farm' && ./scripts/run_slave_ubuntu.sh; echo; read -p 'Press Enter to close...'"
+Icon=applications-multimedia
+Terminal=false
+Categories=AudioVideo;Utility;
