@@ -2,9 +2,12 @@
 ffarm package entry point and shared exports.
 """
 
-from .profiles import PROFILES, OUTPUT_PATTERN
+from .profiles import PROFILES, PROFILE_CHOICES, PROFILE_SETTINGS, get_profile_settings, build_profile_command
 
 __all__ = [
     "PROFILES",
-    "OUTPUT_PATTERN",
+    "PROFILE_CHOICES",
+    "PROFILE_SETTINGS",
+    "get_profile_settings",
+    "build_profile_command",
 ]

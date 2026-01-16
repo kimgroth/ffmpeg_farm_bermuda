@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
+import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, font
 from pathlib import Path
 
 from sqlmodel import select
@@ -18,6 +20,7 @@ from ..db import session_scope
 from ..discovery import WorkerDiscovery
 from ..master_discovery import MasterAdvertiser
 from ..jobs import delete_all_jobs, delete_jobs, delete_succeeded_jobs, enqueue_folder, reset_failed_jobs
+from ..profiles import PROFILE_CHOICES
 from ..models import Job, JobState, Worker, WorkerStatus
 from ..state import state as master_state
 from ..workers import delete_offline_workers, list_workers, resume_worker, stop_worker
@@ -37,11 +40,20 @@ class MasterGUI:
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.style = ttk.Style(self.root)
+        self.big_font = self._make_big_font()
+        self.huge_font = self._make_huge_font()
 
         self.run_local_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Idle")
         self.pending_var = tk.StringVar(value="Pending: 0")
         self.failed_var = tk.StringVar(value="Failed: 0")
+        self.profile_label_to_key = {label: key for key, label in PROFILE_CHOICES}
+        self.profile_labels = [label for _, label in PROFILE_CHOICES]
+        self.profile_var = tk.StringVar(value=self.profile_labels[0])
+        self.queue_progress_var = tk.DoubleVar(value=0.0)
+        self.queue_progress_text = tk.StringVar(value="Completed 0 / 0")
+        self.total_fps_var = tk.StringVar(value="0.0 fps")
 
         self.jobs_tree = None
         self.workers_tree = None
@@ -56,6 +68,22 @@ class MasterGUI:
 
         choose_button = ttk.Button(control_frame, text="Choose Folder & Enqueue", command=self.choose_folder)
         choose_button.pack(side=tk.LEFT)
+        choose_multi_button = ttk.Button(
+            control_frame, text="Choose Folders (Multi)", command=self.choose_folders
+        )
+        choose_multi_button.pack(side=tk.LEFT, padx=(6, 0))
+
+        profile_label = ttk.Label(control_frame, text="Output Profile")
+        profile_label.pack(side=tk.LEFT, padx=(10, 4))
+        profile_select = ttk.Combobox(
+            control_frame,
+            textvariable=self.profile_var,
+            values=self.profile_labels,
+            state="readonly",
+            width=28,
+        )
+        profile_select.pack(side=tk.LEFT)
+        profile_select.current(0)
 
         local_check = ttk.Checkbutton(
             control_frame,
@@ -77,6 +105,28 @@ class MasterGUI:
         self.pending_label.pack(side=tk.LEFT, padx=5)
         self.failed_label = ttk.Label(control_frame, textvariable=self.failed_var)
         self.failed_label.pack(side=tk.LEFT, padx=5)
+
+        progress_frame = ttk.Frame(self.root, padding=(10, 5))
+        progress_frame.pack(fill=tk.X)
+
+        progress_top = ttk.Frame(progress_frame)
+        progress_top.pack(fill=tk.X)
+        progress_label = ttk.Label(progress_top, textvariable=self.queue_progress_text, font=self.big_font)
+        progress_label.pack(side=tk.LEFT, anchor=tk.W)
+        fps_label = ttk.Label(progress_top, textvariable=self.total_fps_var, font=self.huge_font)
+        fps_label.pack(side=tk.RIGHT, anchor=tk.E)
+
+        self.style.configure("Big.Horizontal.TProgressbar", thickness=28)
+        progress_bar = ttk.Progressbar(
+            progress_frame,
+            variable=self.queue_progress_var,
+            maximum=1.0,
+            mode="determinate",
+            length=800,
+            style="Big.Horizontal.TProgressbar",
+        )
+        progress_bar.pack(fill=tk.X, padx=(0, 0), pady=(6, 4))
+
 
         workers_frame = ttk.Labelframe(self.root, text="Workers", padding=10)
         workers_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
@@ -117,12 +167,13 @@ class MasterGUI:
 
         self.jobs_tree = ttk.Treeview(
             jobs_frame,
-            columns=("input", "state", "progress", "fps", "worker", "attempts"),
+            columns=("input", "profile", "state", "progress", "fps", "worker", "attempts"),
             show="headings",
             height=10,
         )
         for col, heading, width in [
-            ("input", "Input", 280),
+            ("input", "Input", 260),
+            ("profile", "Output Profile", 140),
             ("state", "State", 80),
             ("progress", "Progress", 80),
             ("fps", "FPS", 70),
@@ -161,9 +212,61 @@ class MasterGUI:
         folder = filedialog.askdirectory()
         if not folder:
             return
+        self._enqueue_paths([Path(folder)])
+
+    def choose_folders(self):
+        paths = self._choose_folders_native()
+        if not paths:
+            messagebox.showinfo(
+                "Enqueue",
+                "Multi-folder selection requires macOS AppleScript permissions.\n"
+                "No folders were enqueued.",
+            )
+            return
+        unique_paths: list[Path] = []
+        seen = set()
+        for p in paths:
+            if p not in seen:
+                seen.add(p)
+                unique_paths.append(p)
+        if not unique_paths:
+            messagebox.showinfo("Enqueue", "No folders selected.")
+            return
+        self._enqueue_paths(unique_paths)
+
+    def _handle_drop(self, event):
+        data = event.data
+        if not data:
+            return
         try:
-            added, skipped = enqueue_folder(Path(folder))
-            self.status_var.set(f"Enqueued {added} jobs (skipped {skipped})")
+            parts = self.root.tk.splitlist(data)
+        except Exception:  # noqa: BLE001
+            parts = data.split()
+        paths = []
+        for part in parts:
+            p = Path(part)
+            if p.is_dir():
+                paths.append(p)
+            elif p.is_file():
+                paths.append(p.parent)
+        if not paths:
+            return
+        self._enqueue_paths(paths)
+
+    def _enqueue_paths(self, paths: list[Path]):
+        profile_key = self.profile_label_to_key.get(self.profile_var.get(), PROFILE_CHOICES[0][0])
+        total_added = 0
+        total_skipped = 0
+        total_folders = 0
+        try:
+            for path in paths:
+                total_folders += 1
+                added, skipped = enqueue_folder(path, profile=profile_key)
+                total_added += added
+                total_skipped += skipped
+            self.status_var.set(
+                f"Processed {total_folders} folder(s): enqueued {total_added} jobs (skipped {total_skipped})"
+            )
         except Exception as exc:  # noqa: BLE001
             log.exception("Failed to enqueue jobs")
             messagebox.showerror("Error", f"Unable to enqueue jobs:\n{exc}")
@@ -214,12 +317,19 @@ class MasterGUI:
         worker_names = {worker.id: worker.name for worker in list_workers()}
         pending = 0
         failed = 0
+        completed = 0
+        total_fps = 0.0
         for job in jobs:
             if job.state == JobState.PENDING:
                 pending += 1
             elif job.state == JobState.FAILED:
                 failed += 1
+            elif job.state == JobState.SUCCEEDED:
+                completed += 1
             fps_display = self._format_fps(job.stdout_tail)
+            fps_value = self._extract_fps(job.stdout_tail)
+            if job.state == JobState.RUNNING and fps_value is not None:
+                total_fps += fps_value
             worker_display = "-"
             if job.worker_id:
                 worker_display = worker_names.get(job.worker_id, job.worker_id)
@@ -229,6 +339,7 @@ class MasterGUI:
                 iid=str(job.id),
                 values=(
                     Path(job.input_path).name,
+                    job.profile,
                     job.state,
                     f"{job.progress * 100:.1f}%",
                     fps_display,
@@ -243,19 +354,75 @@ class MasterGUI:
             self.jobs_tree.focus(focused)
         self.pending_var.set(f"Pending: {pending}")
         self.failed_var.set(f"Failed: {failed}")
+        total_jobs = len(jobs)
+        ratio = (completed / total_jobs) if total_jobs else 0.0
+        self.queue_progress_var.set(ratio)
+        self.queue_progress_text.set(f"Completed {completed} / {total_jobs}")
+        self.total_fps_var.set(f"{total_fps:.1f} fps")
 
     @staticmethod
     def _format_fps(stdout_tail: str | None) -> str:
-        if not stdout_tail:
-            return "-"
-        matches = re.findall(r"fps=([0-9]+(?:\.[0-9]+)?)", stdout_tail)
-        if not matches:
-            return "-"
-        try:
-            value = float(matches[-1])
-        except ValueError:
+        value = MasterGUI._extract_fps(stdout_tail)
+        if value is None:
             return "-"
         return f"{value:.1f}"
+
+    @staticmethod
+    def _extract_fps(stdout_tail: str | None) -> float | None:
+        if not stdout_tail:
+            return None
+        matches = re.findall(r"fps=([0-9]+(?:\.[0-9]+)?)", stdout_tail)
+        if not matches:
+            return None
+        try:
+            return float(matches[-1])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _make_big_font():
+        base = font.nametofont("TkDefaultFont").copy()
+        base.configure(size=12, weight="bold")
+        return base
+
+    @staticmethod
+    def _make_huge_font():
+        base = font.nametofont("TkDefaultFont").copy()
+        base.configure(size=20, weight="bold")
+        return base
+
+    def _choose_folders_native(self) -> list[Path] | None:
+        """
+        macOS-only multi-folder picker via AppleScript. Returns None on failure.
+        """
+        if sys.platform != "darwin":
+            return None
+        script = r'''
+            set chosenFolders to choose folder with multiple selections allowed
+            set output to ""
+            repeat with f in chosenFolders
+                set output to output & POSIX path of f & linefeed
+            end repeat
+            return output
+        '''
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            return None
+        paths: list[Path] = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            p = Path(line)
+            if p.is_dir():
+                paths.append(p)
+        return paths
 
     def soft_stop_worker(self):
         worker_id = self._selected_worker_id()

@@ -14,7 +14,7 @@ from sqlmodel import select
 from .config import LEASE_DURATION_SECONDS
 from .db import session_scope
 from .models import Job, JobState
-from .profiles import PROFILES, OUTPUT_PATTERN
+from .profiles import OUTPUT_SUBDIRS, get_profile_settings
 
 VIDEO_EXTENSIONS = {".mov", ".mp4", ".mxf", ".mkv", ".avi", ".m4v"}
 
@@ -29,18 +29,35 @@ def enqueue_folder(root: Path, profile: str = "prores_proxy_1280") -> tuple[int,
     if not root.exists():
         raise FileNotFoundError(root)
 
-    proxies_dir = root / "PROXIES"
-    proxies_dir.mkdir(parents=True, exist_ok=True)
+    settings = get_profile_settings(profile)
+    output_root = root / settings["output_subdir"]
+    output_root.mkdir(parents=True, exist_ok=True)
 
     added = 0
     skipped = 0
+
+    filter_prefix = settings.get("filter_prefix")
+    mirror_first_subdir = bool(settings.get("mirror_first_subdir"))
+    output_pattern = settings["output_pattern"]
+    ignore_proxy_suffix = bool(settings.get("ignore_proxy_suffix"))
 
     with session_scope() as session:
         existing_outputs: Set[str] = {
             row[0] for row in session.exec(select(Job.output_path)).all()
         }
-        for input_path in iter_videos(root):
-            output_path = derive_output_path(input_path, proxies_dir, existing_outputs)
+        for input_path in iter_videos(root, exclude_dirs=OUTPUT_SUBDIRS):
+            if filter_prefix and not Path(input_path).name.startswith(filter_prefix):
+                continue
+            if ignore_proxy_suffix and Path(input_path).stem.endswith("_Proxy"):
+                continue
+            output_path = derive_output_path(
+                input_path,
+                root,
+                output_root,
+                output_pattern,
+                existing_outputs,
+                mirror_first_subdir=mirror_first_subdir,
+            )
             existing = session.exec(
                 select(Job).where(Job.input_path == str(input_path))
             ).first()
@@ -60,21 +77,41 @@ def enqueue_folder(root: Path, profile: str = "prores_proxy_1280") -> tuple[int,
     return added, skipped
 
 
-def iter_videos(root: Path) -> Iterable[Path]:
+def iter_videos(root: Path, exclude_dirs: set[str] | None = None) -> Iterable[Path]:
+    exclude_dirs = exclude_dirs or set()
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d != "PROXIES"]
+        dirnames[:] = [d for d in dirnames if d not in exclude_dirs]
         for filename in filenames:
             path = Path(dirpath) / filename
             if path.suffix.lower() in VIDEO_EXTENSIONS:
                 yield path
 
 
-def derive_output_path(input_path: Path, proxies_dir: Path, existing_outputs: Set[str]) -> Path:
-    stem = input_path.stem
-    candidate = proxies_dir / OUTPUT_PATTERN.format(stem=stem)
+def derive_output_path(
+    input_path: Path,
+    root: Path,
+    output_root: Path,
+    pattern: str,
+    existing_outputs: Set[str],
+    *,
+    mirror_first_subdir: bool = False,
+) -> Path:
+    base_stem = input_path.stem
+    base_name = input_path.name
+    relative = input_path.relative_to(root)
+    first_level_dir = relative.parts[0] if len(relative.parts) > 1 else None
+    output_dir = output_root
+    if mirror_first_subdir and first_level_dir:
+        output_dir = output_root / first_level_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+    stem_value = base_stem
+    name_value = base_name
+    candidate = output_dir / pattern.format(stem=stem_value, name=name_value)
     counter = 1
     while str(candidate) in existing_outputs or candidate.exists():
-        candidate = proxies_dir / OUTPUT_PATTERN.format(stem=f"{stem}_{counter}")
+        stem_value = f"{base_stem}_{counter}"
+        name_value = f"{base_stem}_{counter}{Path(base_name).suffix}"
+        candidate = output_dir / pattern.format(stem=stem_value, name=name_value)
         counter += 1
     return candidate
 
