@@ -506,7 +506,7 @@ class MasterGUI:
         if not git_bin:
             self.update_status_var.set("Update skipped (git not found)")
             return
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[2]
         if not (repo_root / ".git").exists():
             self.update_status_var.set("Update skipped (not a git checkout)")
             return
