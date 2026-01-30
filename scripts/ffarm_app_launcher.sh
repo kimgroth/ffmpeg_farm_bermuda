@@ -33,8 +33,13 @@ mkdir -p "$APP_SUPPORT"
 
 if [ ! -d "$REPO_DIR/.git" ]; then
   if ! command -v git >/dev/null 2>&1; then
+    notify "FFarm needs git. Install Xcode Command Line Tools to continue."
     echo "[ffarm] ERROR: git is required to install FFarm."
     exit 1
+  fi
+  if [ -d "$REPO_DIR" ]; then
+    echo "[ffarm] Repo missing .git; removing and recloning."
+    rm -rf "$REPO_DIR"
   fi
   notify "First-time setup: downloading FFarm..."
   echo "[ffarm] Cloning FFarm repo..."
