@@ -5,7 +5,9 @@ Tkinter GUI for the master node.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -15,7 +17,7 @@ from pathlib import Path
 
 from sqlmodel import select
 
-from ..config import APP_NAME, GUI_REFRESH_INTERVAL_MS
+from ..config import APP_NAME, APP_VERSION, GUI_REFRESH_INTERVAL_MS
 from ..db import session_scope
 from ..discovery import WorkerDiscovery
 from ..master_discovery import MasterAdvertiser
@@ -43,6 +45,27 @@ class MasterGUI:
         self.style = ttk.Style(self.root)
         self.big_font = self._make_big_font()
         self.huge_font = self._make_huge_font()
+        self.mode_title_font = self._make_mode_title_font()
+
+        self.mode_var = tk.StringVar(value="master")
+        self._refresh_after_id = None
+        self._master_services_running = False
+        self._themes = {
+            "master": {
+                "bg": "#0b0b0b",
+                "panel": "#0f0f0f",
+                "accent": "#1f1f1f",
+                "text": "#f5f5f5",
+                "muted": "#bdbdbd",
+            },
+            "worker": {
+                "bg": "#0b0b0b",
+                "panel": "#0f0f0f",
+                "accent": "#1f1f1f",
+                "text": "#f5f5f5",
+                "muted": "#bdbdbd",
+            },
+        }
 
         self.run_local_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Idle")
@@ -59,11 +82,73 @@ class MasterGUI:
         self.workers_tree = None
         self.local_worker: WorkerClient | None = None
         self.local_worker_thread: threading.Thread | None = None
+        self.worker_client: WorkerClient | None = None
+        self.worker_thread: threading.Thread | None = None
+        self.worker_status_var = tk.StringVar(value="Stopped")
+        self.worker_activity_var = tk.StringVar(value="Idle")
+
+        self.mode_bar = None
+        self.mode_title = None
+        self.mode_toggle_frame = None
+        self.mode_master_btn = None
+        self.mode_worker_btn = None
+        self.update_status_var = tk.StringVar(value="")
+        self.update_status_label = None
+        self.master_frame = None
+        self.worker_frame = None
+        self.progress_style = "Mode.Horizontal.TProgressbar"
 
         self._build_layout()
 
     def _build_layout(self):
-        control_frame = ttk.Frame(self.root, padding=10)
+        self._build_mode_bar()
+        self.master_frame = tk.Frame(self.root, bd=0, highlightthickness=0)
+        self.worker_frame = tk.Frame(self.root, bd=0, highlightthickness=0)
+        self._build_master_layout(self.master_frame)
+        self._build_worker_layout(self.worker_frame)
+        self._apply_mode_theme(self.mode_var.get())
+        self._show_mode_frame(self.mode_var.get())
+
+    def _build_mode_bar(self):
+        self.mode_bar = tk.Frame(self.root, bd=0, highlightthickness=0)
+        self.mode_bar.pack(fill=tk.X)
+
+        self.mode_title = tk.Label(
+            self.mode_bar,
+            text="FFarm",
+            font=self.mode_title_font,
+            anchor="w",
+        )
+        self.mode_title.pack(side=tk.LEFT, padx=12, pady=10)
+
+        self.update_status_label = tk.Label(
+            self.mode_bar,
+            textvariable=self.update_status_var,
+            anchor="w",
+        )
+        self.update_status_label.pack(side=tk.LEFT, padx=12, pady=10)
+
+        self.mode_toggle_frame = tk.Frame(self.mode_bar, bd=0, highlightthickness=0)
+        self.mode_toggle_frame.pack(side=tk.RIGHT, padx=10, pady=6)
+
+        self.mode_master_btn = ttk.Button(
+            self.mode_toggle_frame,
+            text="Master Mode",
+            command=lambda: self._set_mode("master"),
+            style="Mode.TButton",
+        )
+        self.mode_master_btn.pack(side=tk.LEFT, padx=4)
+
+        self.mode_worker_btn = ttk.Button(
+            self.mode_toggle_frame,
+            text="Worker Mode",
+            command=lambda: self._set_mode("worker"),
+            style="Mode.TButton",
+        )
+        self.mode_worker_btn.pack(side=tk.LEFT, padx=4)
+
+    def _build_master_layout(self, parent: tk.Misc):
+        control_frame = ttk.Frame(parent, padding=10)
         control_frame.pack(fill=tk.X)
 
         choose_button = ttk.Button(control_frame, text="Choose Folder & Enqueue", command=self.choose_folder)
@@ -106,7 +191,7 @@ class MasterGUI:
         self.failed_label = ttk.Label(control_frame, textvariable=self.failed_var)
         self.failed_label.pack(side=tk.LEFT, padx=5)
 
-        progress_frame = ttk.Frame(self.root, padding=(10, 5))
+        progress_frame = ttk.Frame(parent, padding=(10, 5))
         progress_frame.pack(fill=tk.X)
 
         progress_top = ttk.Frame(progress_frame)
@@ -116,19 +201,18 @@ class MasterGUI:
         fps_label = ttk.Label(progress_top, textvariable=self.total_fps_var, font=self.huge_font)
         fps_label.pack(side=tk.RIGHT, anchor=tk.E)
 
-        self.style.configure("Big.Horizontal.TProgressbar", thickness=28)
+        self.style.configure(self.progress_style, thickness=28)
         progress_bar = ttk.Progressbar(
             progress_frame,
             variable=self.queue_progress_var,
             maximum=1.0,
             mode="determinate",
             length=800,
-            style="Big.Horizontal.TProgressbar",
+            style=self.progress_style,
         )
         progress_bar.pack(fill=tk.X, padx=(0, 0), pady=(6, 4))
 
-
-        workers_frame = ttk.Labelframe(self.root, text="Workers", padding=10)
+        workers_frame = ttk.Labelframe(parent, text="Workers", padding=10)
         workers_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         self.workers_tree = ttk.Treeview(
@@ -162,7 +246,7 @@ class MasterGUI:
         )
         clear_offline_button.pack(fill=tk.X, pady=2)
 
-        jobs_frame = ttk.Labelframe(self.root, text="Jobs", padding=10)
+        jobs_frame = ttk.Labelframe(parent, text="Jobs", padding=10)
         jobs_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         self.jobs_tree = ttk.Treeview(
@@ -201,10 +285,33 @@ class MasterGUI:
         )
         clear_selected_button.pack(side=tk.LEFT, padx=5)
 
+    def _build_worker_layout(self, parent: tk.Misc):
+        header = ttk.Frame(parent, padding=12)
+        header.pack(fill=tk.X)
+
+        title = ttk.Label(header, text="Worker Control", font=self.big_font)
+        title.pack(side=tk.LEFT)
+
+        status_label = ttk.Label(header, textvariable=self.worker_status_var, font=self.big_font)
+        status_label.pack(side=tk.RIGHT)
+
+        buttons = ttk.Frame(parent, padding=(16, 6))
+        buttons.pack(fill=tk.X)
+        start_button = ttk.Button(buttons, text="Start Worker", command=self.start_worker)
+        start_button.pack(side=tk.LEFT)
+        stop_button = ttk.Button(buttons, text="Stop Worker", command=self.stop_worker)
+        stop_button.pack(side=tk.LEFT, padx=6)
+
+        status_panel = ttk.Frame(parent, padding=(16, 8))
+        status_panel.pack(fill=tk.X)
+        activity_label = ttk.Label(status_panel, text="Status", font=self.big_font)
+        activity_label.pack(side=tk.LEFT)
+        activity_value = ttk.Label(status_panel, textvariable=self.worker_activity_var, font=self.big_font)
+        activity_value.pack(side=tk.LEFT, padx=(12, 0))
+
     def start(self):
-        self.server.start()
-        self.discovery.start()
-        self.advertiser.start()
+        self._auto_update_on_launch()
+        self._set_mode(self.mode_var.get(), initial=True)
         self.refresh()
         self.root.mainloop()
 
@@ -272,9 +379,11 @@ class MasterGUI:
             messagebox.showerror("Error", f"Unable to enqueue jobs:\n{exc}")
 
     def refresh(self):
-        self._refresh_workers()
-        self._refresh_jobs()
-        self.root.after(GUI_REFRESH_INTERVAL_MS, self.refresh)
+        if self._master_services_running:
+            self._refresh_workers()
+            self._refresh_jobs()
+        self._refresh_worker_status()
+        self._refresh_after_id = self.root.after(GUI_REFRESH_INTERVAL_MS, self.refresh)
 
     def pause_queue(self):
         master_state.set_paused(True)
@@ -390,6 +499,335 @@ class MasterGUI:
         base = font.nametofont("TkDefaultFont").copy()
         base.configure(size=20, weight="bold")
         return base
+
+    def _auto_update_on_launch(self):
+        self.update_status_var.set("Checking for updates...")
+        git_bin = shutil.which("git")
+        if not git_bin:
+            self.update_status_var.set("Update skipped (git not found)")
+            return
+        repo_root = Path(__file__).resolve().parents[3]
+        if not (repo_root / ".git").exists():
+            self.update_status_var.set("Update skipped (not a git checkout)")
+            return
+        try:
+            status = subprocess.run(
+                [git_bin, "-C", str(repo_root), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:  # noqa: BLE001
+            self.update_status_var.set("Update failed (status error)")
+            return
+        if status.stdout.strip():
+            log.info("Auto-update skipped: working tree is dirty.")
+            self.update_status_var.set("Update skipped (local changes)")
+            return
+        try:
+            head_before = subprocess.run(
+                [git_bin, "-C", str(repo_root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except Exception:  # noqa: BLE001
+            self.update_status_var.set("Update failed (git error)")
+            return
+        try:
+            subprocess.run(
+                [git_bin, "-C", str(repo_root), "pull", "--ff-only"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:  # noqa: BLE001
+            self.update_status_var.set("Update skipped (non-fast-forward)")
+            return
+        try:
+            head_after = subprocess.run(
+                [git_bin, "-C", str(repo_root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except Exception:  # noqa: BLE001
+            self.update_status_var.set("Update failed (git error)")
+            return
+        if head_before == head_after:
+            self.update_status_var.set("Up to date")
+            return
+        log.info("Auto-update applied. Restarting.")
+        self.update_status_var.set("Update applied. Restarting...")
+        args = [
+            sys.executable,
+            "-m",
+            "ffarm",
+            "master",
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+        ]
+        try:
+            os.execv(sys.executable, args)
+        except Exception:  # noqa: BLE001
+            log.exception("Auto-restart failed after update.")
+
+    @staticmethod
+    def _make_mode_title_font():
+        base = font.nametofont("TkDefaultFont").copy()
+        base.configure(size=18, weight="bold")
+        return base
+
+    def _apply_mode_theme(self, mode: str):
+        theme = self._themes.get(mode, self._themes["master"])
+        try:
+            self.style.theme_use("clam")
+        except tk.TclError:
+            pass
+        self.root.configure(bg=theme["bg"])
+        if self.mode_bar:
+            self.mode_bar.configure(bg=theme["bg"])
+        if self.mode_toggle_frame:
+            self.mode_toggle_frame.configure(bg=theme["bg"])
+        if self.mode_title:
+            self.mode_title.configure(
+                text=f"FFarm v{APP_VERSION} — {mode.capitalize()} Mode",
+                bg=theme["bg"],
+                fg=theme["text"],
+            )
+        if self.update_status_label:
+            self.update_status_label.configure(
+                bg=theme["bg"],
+                fg=theme["muted"],
+            )
+        if self.master_frame:
+            self.master_frame.configure(bg=theme["panel"])
+        if self.worker_frame:
+            self.worker_frame.configure(bg=theme["panel"])
+
+        active_bg = theme["accent"]
+        inactive_bg = theme["panel"]
+        active_fg = theme["text"]
+        inactive_fg = theme["muted"]
+
+        self.style.configure(
+            "Mode.TButton",
+            background=inactive_bg,
+            foreground=inactive_fg,
+            borderwidth=0,
+            focusthickness=0,
+            padding=(14, 8),
+        )
+        self.style.configure(
+            "ModeActive.TButton",
+            background=active_bg,
+            foreground=active_fg,
+            borderwidth=0,
+            focusthickness=0,
+            padding=(14, 8),
+        )
+        self.style.map(
+            "Mode.TButton",
+            background=[("active", active_bg)],
+            foreground=[("active", active_fg)],
+        )
+        if self.mode_master_btn and self.mode_worker_btn:
+            self.mode_master_btn.configure(
+                style="ModeActive.TButton" if mode == "master" else "Mode.TButton"
+            )
+            self.mode_worker_btn.configure(
+                style="ModeActive.TButton" if mode == "worker" else "Mode.TButton"
+            )
+
+        self.style.configure(
+            self.progress_style,
+            troughcolor=theme["panel"],
+            background=theme["accent"],
+        )
+
+        self.style.configure(
+            "TFrame",
+            background=theme["panel"],
+        )
+        self.style.configure(
+            "TLabelframe",
+            background=theme["panel"],
+            foreground=theme["text"],
+        )
+        self.style.configure(
+            "TLabelframe.Label",
+            background=theme["panel"],
+            foreground=theme["text"],
+        )
+        self.style.configure(
+            "TLabel",
+            background=theme["panel"],
+            foreground=theme["text"],
+        )
+        self.style.configure(
+            "TButton",
+            background=theme["accent"],
+            foreground=theme["text"],
+            borderwidth=0,
+            focusthickness=0,
+            padding=(10, 6),
+        )
+        self.style.map(
+            "TButton",
+            background=[("active", theme["accent"]), ("pressed", theme["accent"])],
+            foreground=[("active", theme["text"]), ("pressed", theme["text"])],
+        )
+        self.style.configure(
+            "TCheckbutton",
+            background=theme["panel"],
+            foreground=theme["text"],
+        )
+        self.style.configure(
+            "TCombobox",
+            fieldbackground=theme["bg"],
+            background=theme["panel"],
+            foreground=theme["text"],
+            arrowcolor=theme["text"],
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", theme["bg"])],
+            foreground=[("readonly", theme["text"])],
+        )
+        self.style.configure(
+            "Treeview",
+            background=theme["bg"],
+            fieldbackground=theme["bg"],
+            foreground=theme["text"],
+            borderwidth=0,
+        )
+        self.style.map(
+            "Treeview",
+            background=[("selected", theme["accent"])],
+            foreground=[("selected", theme["text"])],
+        )
+        self.style.configure(
+            "Treeview.Heading",
+            background=theme["panel"],
+            foreground=theme["text"],
+            relief="flat",
+        )
+
+    def _show_mode_frame(self, mode: str):
+        if self.master_frame:
+            self.master_frame.pack_forget()
+        if self.worker_frame:
+            self.worker_frame.pack_forget()
+        if mode == "worker":
+            self.worker_frame.pack(fill=tk.BOTH, expand=True)
+        else:
+            self.master_frame.pack(fill=tk.BOTH, expand=True)
+
+    def _set_mode(self, mode: str, initial: bool = False):
+        current = self.mode_var.get()
+        if not initial and mode == current:
+            return
+        self.mode_var.set(mode)
+        self._apply_mode_theme(mode)
+        self._show_mode_frame(mode)
+        if mode == "master":
+            self._stop_worker()
+            self._start_master_services()
+        else:
+            self._stop_local_worker()
+            self._stop_master_services()
+            self._refresh_worker_status()
+
+    def _start_master_services(self):
+        if self._master_services_running:
+            return
+        self.server.start()
+        self.discovery.start()
+        self.advertiser.start()
+        self._master_services_running = True
+        self.worker_activity_var.set("Idle")
+
+    def _stop_master_services(self):
+        if not self._master_services_running:
+            return
+        self.discovery.stop()
+        self.advertiser.stop()
+        self.server.stop()
+        self._master_services_running = False
+
+    def start_worker(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            return
+        master_url = None
+        name = None
+        advertise = True
+        try:
+            self.worker_client = WorkerClient(
+                master_url,
+                name=name,
+                advertise=advertise,
+            )
+        except RuntimeError as exc:
+            messagebox.showerror("Worker", str(exc))
+            return
+        self.worker_status_var.set("Starting...")
+        self.worker_thread = threading.Thread(target=self._run_worker, daemon=True)
+        self.worker_thread.start()
+        self.worker_status_var.set("Running")
+
+    def _run_worker(self):
+        try:
+            if self.worker_client:
+                self.worker_client.run()
+        except Exception:  # noqa: BLE001
+            log.exception("Worker exited unexpectedly")
+            self.root.after(0, lambda: self.worker_status_var.set("Error (see logs)"))
+            return
+        self.root.after(0, lambda: self.worker_status_var.set("Stopped"))
+
+    def stop_worker(self):
+        self._stop_worker()
+
+    def _stop_worker(self):
+        if self.worker_client:
+            self.worker_client.stop()
+        if self.worker_thread:
+            self.worker_thread.join(timeout=2.0)
+        self.worker_thread = None
+        self.worker_client = None
+        self.worker_status_var.set("Stopped")
+        self.worker_activity_var.set("Idle")
+
+    def _stop_local_worker(self):
+        if self.local_worker:
+            self.local_worker.stop()
+        if self.local_worker_thread:
+            self.local_worker_thread.join(timeout=1.0)
+        self.local_worker = None
+        self.local_worker_thread = None
+        self.run_local_var.set(False)
+
+    def _refresh_worker_status(self):
+        if self.mode_var.get() != "worker":
+            return
+        if not self.worker_thread or not self.worker_thread.is_alive():
+            self.worker_status_var.set("Stopped")
+            self.worker_activity_var.set("Idle")
+            return
+        if not self.worker_client:
+            self.worker_status_var.set("Running")
+            self.worker_activity_var.set("Ready")
+            return
+        current_job = getattr(self.worker_client, "_current_job", None)
+        if current_job is None:
+            self.worker_status_var.set("Ready")
+            self.worker_activity_var.set("Ready")
+        else:
+            name = Path(current_job.input_path).name
+            self.worker_status_var.set("Converting")
+            self.worker_activity_var.set(f"Converting {name}")
 
     def _choose_folders_native(self) -> list[Path] | None:
         """
@@ -508,18 +946,13 @@ class MasterGUI:
             self.local_worker_thread.start()
             self.status_var.set("Local worker running")
         else:
-            if self.local_worker:
-                self.local_worker.stop()
-            if self.local_worker_thread:
-                self.local_worker_thread.join(timeout=1.0)
+            self._stop_local_worker()
             self.status_var.set("Local worker stopped")
 
     def on_close(self):
-        if self.local_worker:
-            self.local_worker.stop()
-        if self.local_worker_thread:
-            self.local_worker_thread.join(timeout=1.0)
-        self.discovery.stop()
-        self.advertiser.stop()
-        self.server.stop()
+        if self._refresh_after_id:
+            self.root.after_cancel(self._refresh_after_id)
+        self._stop_worker()
+        self._stop_local_worker()
+        self._stop_master_services()
         self.root.destroy()

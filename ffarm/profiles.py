@@ -32,6 +32,31 @@ PROFILES: dict[str, list[str]] = {
         "mov",
         "{output}",
     ],
+    "prores_proxy_1920": [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-progress",
+        "pipe:1",
+        "-i",
+        "{input}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-vf",
+        "scale='if(gt(iw,ih),1920,-2)':'if(gt(ih,iw),1920,-2)'",
+        "-c:v",
+        "prores_ks",
+        "-profile:v",
+        "0",
+        "-c:a",
+        "copy",
+        "-f",
+        "mov",
+        "{output}",
+    ],
     "dji_drone_prores_standard": [
         "-hide_banner",
         "-loglevel",
@@ -59,11 +84,18 @@ PROFILES: dict[str, list[str]] = {
 
 PROFILE_CHOICES = [
     ("prores_proxy_1280", "Proxy 1280 (ProRes Proxy)"),
+    ("prores_proxy_1920", "Proxy 1920 (ProRes Proxy)"),
     ("dji_drone_prores_standard", "DJI Drone ProRes Standard"),
 ]
 
 PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
     "prores_proxy_1280": {
+        "output_subdir": "PROXIES",
+        "output_pattern": "{stem}_Proxy.mov",
+        "filter_prefix": None,
+        "mirror_first_subdir": False,
+    },
+    "prores_proxy_1920": {
         "output_subdir": "PROXIES",
         "output_pattern": "{stem}_Proxy.mov",
         "filter_prefix": None,

@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 APP_NAME = "LAN FFmpeg Farm"
+APP_VERSION = "1.0.0"
 SERVICE_TYPE = "_ffarm._tcp.local."
 MASTER_SERVICE_TYPE = "_ffarm-master._tcp.local."
 DEFAULT_DB_PATH = Path.home() / ".ffarm" / "ffarm.sqlite3"
