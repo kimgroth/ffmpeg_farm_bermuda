@@ -521,9 +521,21 @@ class MasterGUI:
             self.update_status_var.set("Update failed (status error)")
             return
         if status.stdout.strip():
-            log.info("Auto-update skipped: working tree is dirty.")
-            self.update_status_var.set("Update skipped (local changes)")
-            return
+            self._clean_update_artifacts(repo_root, git_bin)
+            try:
+                status = subprocess.run(
+                    [git_bin, "-C", str(repo_root), "status", "--porcelain"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:  # noqa: BLE001
+                self.update_status_var.set("Update failed (status error)")
+                return
+            if status.stdout.strip():
+                log.info("Auto-update skipped: working tree is dirty.")
+                self.update_status_var.set("Update skipped (local changes)")
+                return
         try:
             head_before = subprocess.run(
                 [git_bin, "-C", str(repo_root), "rev-parse", "HEAD"],
@@ -573,6 +585,30 @@ class MasterGUI:
             os.execv(sys.executable, args)
         except Exception:  # noqa: BLE001
             log.exception("Auto-restart failed after update.")
+
+    @staticmethod
+    def _clean_update_artifacts(repo_root: Path, git_bin: str):
+        cleanup_paths = [
+            "ffarm/__pycache__",
+            "ffarm/master/__pycache__",
+            "ffarm/worker/__pycache__",
+            ".DS_Store",
+        ]
+        try:
+            subprocess.run(
+                [git_bin, "-C", str(repo_root), "checkout", "--", *cleanup_paths],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [git_bin, "-C", str(repo_root), "clean", "-fd", "--", *cleanup_paths],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:  # noqa: BLE001
+            return
 
     @staticmethod
     def _make_mode_title_font():
